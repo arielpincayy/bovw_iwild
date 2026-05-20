@@ -1,8 +1,7 @@
 """
-Pipeline: CLASES → SIFT keypoints → KMeans (K óptimo) → BoVW → TF-IDF → NN classifier
-Imágenes de entrada: 225x225 px
-SIFT extrae N descriptores de 128 dims por imagen (sin tiles)
-Todo se guarda en: experiment_noreduction/
+Pipeline: CLASES → tiles 8x8 → KMeans (K=256) → BoVW → TF-IDF → NN classifier
+Imágenes de entrada: 225x225 px → tiles de 8x8 con stride 8 (sin overlap)
+Todo se guarda en: experimen_noreduction/
 """
 
 import os
@@ -14,10 +13,7 @@ from tqdm import tqdm
 from threadpoolctl import threadpool_limits
 
 from sklearn.cluster import MiniBatchKMeans
-from sklearn.metrics import (
-    silhouette_score, davies_bouldin_score,
-    classification_report, confusion_matrix
-)
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -34,22 +30,13 @@ import seaborn as sns
 # ─────────────────────────────────────────────
 INPUT_ROOT   = "CLASES"
 EXCLUDE_DIR  = "OUTLIERS"
+TILE_SIZE    = 8
 IMG_SIZE     = 225
+BEST_K       = 256
 N_CORES      = 16
+NGRAMS       = (1, 4)
 
-# SIFT
-SIFT_N_FEATURES = 100     # 0 = sin límite, SIFT decide cuántos keypoints hay
-SIFT_CONTRASTH  = 0.03  # umbral de contraste (bajar → más keypoints en zonas planas)
-SIFT_EDGEH      = 10    # umbral de bordes
-
-# KMeans
-K_MIN, K_MAX, K_STEP = 64, 512, 64
-K_SAMPLE     = 50_000
-
-# TF-IDF
-NGRAMS = (1,4)
-
-OUTPUT_ROOT  = "experiment_noreduction_sift_sorted"
+OUTPUT_ROOT  = "experiment_noreduction_puyucunapi_ngram1-4"
 METRICS_DIR  = os.path.join(OUTPUT_ROOT, "metrics")
 PKL_KMEANS   = os.path.join(OUTPUT_ROOT, "kmeans_bovw.pkl")
 PKL_TFIDF    = os.path.join(OUTPUT_ROOT, "tfidf_vectorizer.pkl")
@@ -86,166 +73,88 @@ img_paths, img_labels = collect_images(INPUT_ROOT, EXCLUDE_DIR)
 print(f"  Total imágenes: {len(img_paths)} | Clases: {sorted(set(img_labels))}")
 
 # ─────────────────────────────────────────────
-# PASO 2: EXTRACCIÓN DE DESCRIPTORES SIFT
+# PASO 2: EXTRACCIÓN DE TILES (8x8 → vectores de 64 dims)
 # ─────────────────────────────────────────────
-sift = cv2.SIFT_create(
-    nfeatures=SIFT_N_FEATURES,
-    contrastThreshold=SIFT_CONTRASTH,
-    edgeThreshold=SIFT_EDGEH
-)
+def extract_tiles(img_bgr, tile_size=TILE_SIZE):
+    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w  = gray.shape
+    tiles = []
+    for y in range(0, h - tile_size + 1, tile_size):
+        for x in range(0, w - tile_size + 1, tile_size):
+            tile = gray[y:y+tile_size, x:x+tile_size].astype(np.float32) / 255.0
+            tiles.append(tile.flatten())  # (64,)
+    return tiles
 
-print("\n[2/5] Extrayendo descriptores SIFT...")
-all_descriptors = []   # para entrenar KMeans: lista de arrays (N_kp, 128)
-img_desc_map    = []   # (path, label, descriptors_array)
-skipped         = 0
+print("\n[2/5] Extrayendo tiles de todas las imágenes...")
+all_tiles    = []
+img_tile_map = []
 
 for path, label in tqdm(zip(img_paths, img_labels), total=len(img_paths)):
     img = cv2.imread(path)
     if img is None:
-        skipped += 1
         continue
     if img.shape[:2] != (IMG_SIZE, IMG_SIZE):
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    tiles = extract_tiles(img)
+    if tiles:
+        img_tile_map.append((path, label, tiles))
+        all_tiles.extend(tiles)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, descs = sift.detectAndCompute(gray, None)
-
-    if descs is None or len(descs) == 0:
-        skipped += 1
-        continue
-
-    descs = descs.astype(np.float32)
-    img_desc_map.append((path, label, descs))
-    all_descriptors.append(descs)
-
-all_desc_matrix = np.vstack(all_descriptors).astype(np.float32)
-print(f"  Imágenes procesadas: {len(img_desc_map)}  (omitidas sin keypoints: {skipped})")
-print(f"  Total descriptores SIFT: {all_desc_matrix.shape[0]} | Dims: {all_desc_matrix.shape[1]}")
+all_tiles_matrix = np.vstack(all_tiles).astype(np.float32)
+print(f"  Total tiles: {all_tiles_matrix.shape[0]} | Dims: {all_tiles_matrix.shape[1]}")
 
 # ─────────────────────────────────────────────
-# PASO 3: KMEANS — BÚSQUEDA DE K ÓPTIMO (16 cores fijos)
+# PASO 3: KMEANS con K=256
 # ─────────────────────────────────────────────
-print("\n[3/5] Buscando K óptimo para KMeans...")
-
-rng        = np.random.default_rng(42)
-sample_idx = rng.choice(len(all_desc_matrix),
-                        size=min(K_SAMPLE, len(all_desc_matrix)),
-                        replace=False)
-sample     = all_desc_matrix[sample_idx]
-
-k_values, inertias, silhouettes, dbs = [], [], [], []
-
-for k in range(K_MIN, K_MAX + 1, K_STEP):
-    print(f"  k={k}...", end=" ", flush=True)
-    km = MiniBatchKMeans(n_clusters=k, batch_size=4096,
-                         init="k-means++", n_init=3,
-                         random_state=42, verbose=0)
-    with threadpool_limits(limits=N_CORES):
-        km.fit(all_desc_matrix)
-
-    labels_s = km.predict(sample)
-    sil = silhouette_score(sample, labels_s, random_state=42)
-    db  = davies_bouldin_score(sample, labels_s)
-
-    k_values.append(k)
-    inertias.append(km.inertia_)
-    silhouettes.append(sil)
-    dbs.append(db)
-    print(f"Inertia={km.inertia_:.1f}  Sil={sil:.4f}  DB={db:.4f}")
-
-# Elección automática: codo (2ª derivada) + desempate silueta
-arr     = np.array(inertias)
-d2      = np.diff(np.diff(arr))
-elbow_k = k_values[int(np.argmax(np.abs(d2))) + 1]
-sil_k   = k_values[int(np.argmax(silhouettes))]
-db_k    = k_values[int(np.argmin(dbs))]
-best_k  = elbow_k
-print(f"\n  Codo={elbow_k}  MejorSil={sil_k}  MejorDB={db_k}  → K elegido: {best_k}")
-
-# Gráficas de selección de K
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-for ax, y, title, color, best in zip(
-    axes,
-    [inertias, silhouettes, dbs],
-    ["Inertia (Codo)", "Silhouette ↑", "Davies-Bouldin ↓"],
-    ["steelblue", "seagreen", "darkorange"],
-    [elbow_k, sil_k, db_k]
-):
-    ax.plot(k_values, y, "o-", color=color)
-    ax.axvline(best, color="red", linestyle="--", label=f"k={best}")
-    ax.set_title(title); ax.set_xlabel("k"); ax.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(METRICS_DIR, "kmeans_k_selection.png"), dpi=120)
-plt.close()
-
-# Entrenar KMeans final con 16 cores fijos
-print(f"\n  Entrenando KMeans final con k={best_k}...")
-kmeans = MiniBatchKMeans(n_clusters=best_k, batch_size=4096,
+print(f"\n[3/5] Entrenando KMeans con K={BEST_K}...")
+kmeans = MiniBatchKMeans(n_clusters=BEST_K, batch_size=2048,
                          init="k-means++", n_init=5,
                          random_state=42, verbose=1)
 with threadpool_limits(limits=N_CORES):
-    kmeans.fit(all_desc_matrix)
+    kmeans.fit(all_tiles_matrix)
 
 with open(PKL_KMEANS, "wb") as f:
     pickle.dump(kmeans, f)
 print(f"  Guardado: {PKL_KMEANS}")
 
 # ─────────────────────────────────────────────
-# PASO 4: CODIFICACIÓN BoVW → secuencia ordenada por proximidad al centro
+# PASO 4: CODIFICACIÓN BoVW → secuencia de tokens
 # ─────────────────────────────────────────────
-print("\n[4/5] Codificando imágenes como secuencias de clusters SIFT...")
+print("\n[4/5] Codificando imágenes como secuencias de clusters...")
 
 def id_to_token(cid):
     return f"w{cid}"
 
-CENTER = np.array([IMG_SIZE / 2.0, IMG_SIZE / 2.0])
-
 rows = []
-for path, label in tqdm(zip(img_paths, img_labels), total=len(img_paths)):
-    img = cv2.imread(path)
-    if img is None:
-        continue
-    if img.shape[:2] != (IMG_SIZE, IMG_SIZE):
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    keypoints, descs = sift.detectAndCompute(gray, None)
-
-    if descs is None or len(descs) == 0:
-        continue
-
-    descs = descs.astype(np.float32)
-
-    # Coordenadas (x, y) de cada keypoint
-    kp_coords = np.array([kp.pt for kp in keypoints])  # (N, 2)
-
-    # Distancia de cada kp al centro
-    dists = np.linalg.norm(kp_coords - CENTER, axis=1)  # (N,)
-
-    # Ordenar por distancia ascendente (el más cercano al centro primero)
-    order = np.argsort(dists)
-    descs_ordered = descs[order]
-
-    # Asignar cluster a cada descriptor (ya ordenados)
-    cluster_ids = kmeans.predict(descs_ordered)
+for path, label, tiles in tqdm(img_tile_map):
+    tile_matrix = np.vstack(tiles).astype(np.float32)
+    cluster_ids = kmeans.predict(tile_matrix)
     sentence    = " ".join(id_to_token(c) for c in cluster_ids)
-
     rows.append({"image": os.path.basename(path),
                  "label": label,
-                 "sentence": sentence,
-                 "n_keypoints": len(cluster_ids)})
+                 "sentence": sentence})
 
 df = pd.DataFrame(rows)
 df.to_csv(os.path.join(METRICS_DIR, "visual_sentences.csv"), index=False)
-print(f"  Keypoints promedio por imagen: {df['n_keypoints'].mean():.1f}")
 print(f"  Ejemplos de secuencias:")
 for _, r in df.head(3).iterrows():
-    print(f"    [{r['label']}] ({r['n_keypoints']} kp) {r['sentence'][:80]}...")
+    print(f"    [{r['label']}] {r['sentence']}")
 
 # ─────────────────────────────────────────────
-# PASO 5: TF-IDF (1,4)-gramas → NN classifier
+# PASO 5: TF-IDF (1,1)-gramas → NN classifier
 # ─────────────────────────────────────────────
 print("\n[5/5] Aplicando TF-IDF y entrenando red neuronal...")
+
+MIN_SAMPLES = 7
+class_counts = df["label"].value_counts()
+valid_classes = class_counts[class_counts >= MIN_SAMPLES].index
+dropped = class_counts[class_counts < MIN_SAMPLES]
+if len(dropped) > 0:
+    print(f"  Clases omitidas por pocas muestras (<{MIN_SAMPLES}):")
+    for cls, cnt in dropped.items():
+        print(f"    {cls}: {cnt} muestras")
+df = df[df["label"].isin(valid_classes)].reset_index(drop=True)
+print(f"  Imágenes tras filtrado: {len(df)}  |  Clases restantes: {sorted(valid_classes.tolist())}")
 
 tfidf = TfidfVectorizer(
     token_pattern=r"w\d+",
@@ -385,7 +294,6 @@ report_dict = classification_report(all_true, all_preds,
 pd.DataFrame(report_dict).T.to_csv(os.path.join(METRICS_DIR, "metrics_per_class.csv"))
 
 print(f"\n✓ Pipeline completo. Todo guardado en '{OUTPUT_ROOT}/'")
-print(f"  metrics/kmeans_k_selection.png")
 print(f"  metrics/training_curves.png")
 print(f"  metrics/confusion_matrix.png")
 print(f"  metrics/classification_report.txt")
